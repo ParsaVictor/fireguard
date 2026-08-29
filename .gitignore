@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Pipeline outputs (regenerated on every run)
+outputs/
+
+# Cached model weights (auto-downloaded from Hugging Face)
+models/
+
+# Large source / personal files not part of the public repo
+test_raw_output_5.mp4
+Fire_demo.ipynb
+yolov8-fire-smoke-detection.zip
+PUBLISH.md
+.freebuff/
+
+# OS / editor noise
+.DehydratedDigits
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+
+# Scratch files
+*.png.tmp

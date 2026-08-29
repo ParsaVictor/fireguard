@@ -1,0 +1,8 @@
+ultralytics>=8.3.0
+huggingface_hub>=0.23.0
+opencv-python>=4.9.0
+numpy>=1.26.0
+torch>=2.0.0          # CUDA build recommended: see https://pytorch.org/get-started
+matplotlib>=3.8.0
+pandas>=2.0.0
+jupyterlab>=4.0.0
