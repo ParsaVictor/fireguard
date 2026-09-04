@@ -3,10 +3,11 @@ import os
 import csv
 import time
 import math
+import wave
 import shutil
 import warnings
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from collections import deque
 
 import cv2
@@ -21,7 +22,7 @@ warnings.filterwarnings("ignore")
 
 CONFIG = {
     # --- model ---
-    "model": "yolo26s",          # yolov8n | yolo11s | yolo26s | path/to/custom.pt
+    "model": "yolo26s",          # default & recommended; alternates below stay available
     "imgsz": 640,
     "iou": 0.45,
 
@@ -45,47 +46,59 @@ CONFIG = {
     "confirm_hits": 2,           # need >= K hits in that window to CONFIRM a class
     "clear_frames": 8,           # hold the alarm this many misses before clearing
 
-    # --- alerts ---
-    "alert_cooldown_s": 4.0,     # repeat-alarm interval while hazard is active
+    # --- alert tiers (visual + audio) ---
+    # SMOKING  (gray frame)    : small smoke only, likely cigarette — no alarm sound
+    # WARNING  (orange + beep) : large smoke, fire may be starting — beeper audio
+    # DANGER/CRITICAL (red)    : fire confirmed — siren audio + pulsing red border
+    "cigarette_max_area_frac": 0.004,   # smoke box smaller than 0.4% of frame -> SMOKING
+    "audio_alerts": True,               # embed beep/siren audio into the output MP4
+    "alert_cooldown_s": 4.0,            # repeat-alarm interval while hazard is active
 
     # --- output ---
     "output_dir": "outputs",
     "snapshot": True,            # save evidence PNG on every escalation
+    "drive_backup": True,        # Colab: copy results to MyDrive/FireGuard_Outputs
     "display_samples": 6,        # annotated frames returned for inline display
 }
 
 PROFILES = {
-    "standard":   {"fire": True, "smoke": True,  "conf_fire": 0.30, "conf_smoke": 0.25},
-    "fire-only":  {"fire": True, "smoke": False, "conf_fire": 0.30, "conf_smoke": 0.25},
+    "standard":    {"fire": True, "smoke": True, "conf_fire": 0.30, "conf_smoke": 0.25},
+    "fire-only":   {"fire": True, "smoke": False, "conf_fire": 0.30, "conf_smoke": 0.25},
     "early-smoke": {"fire": True, "smoke": True, "conf_fire": 0.35, "conf_smoke": 0.15},
 }
 
 # ============================================================
-# MODEL REGISTRY — three YOLO generations, all verified on HF
+# MODEL REGISTRY — default is yolo26s; alternates kept for edge devices
 # ============================================================
 
 MODEL_REGISTRY = {
+    "yolo26s": {
+        "repo": "SalahALHaismawi/yolov26-fire-detection",
+        "file": "best.pt",
+        "params": "9.9M",
+        "note": "DEFAULT — newest generation, most temporally stable, sees fire + smoke",
+    },
     "yolov8n": {
         "repo": "rabahdev/fire-smoke-yolov8n",
         "file": "best.pt",
         "params": "3.0M",
-        "note": "Fastest — edge devices / weak CPUs",
+        "note": "optional — fastest, for very weak CPUs / edge boxes",
     },
     "yolo11s": {
         "repo": "leeyunjai/yolo11-firedetect",
         "file": "firedetect-11s.pt",
         "params": "9.4M",
-        "note": "Balanced accuracy vs speed",
-    },
-    "yolo26s": {
-        "repo": "SalahALHaismawi/yolov26-fire-detection",
-        "file": "best.pt",
-        "params": "9.9M",
-        "note": "Newest generation — best accuracy",
+        "note": "optional — middle ground",
     },
 }
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+IN_COLAB = False
+try:
+    from google.colab import drive  # noqa: F401
+    IN_COLAB = True
+except ImportError:
+    pass
 
 
 def load_model(key: str, cache_dir: str = "models"):
@@ -158,7 +171,6 @@ def detect(model, frame, cfg) -> list:
         conf=min(conf_fire, conf_smoke),
         iou=cfg["iou"],
         device=DEVICE,
-        half=(DEVICE == "cuda"),
         verbose=False,
     )
 
@@ -179,27 +191,31 @@ def detect(model, frame, cfg) -> list:
 
 
 # ============================================================
-# HAZARD ENGINE — temporal confirmation + state machine
+# HAZARD ENGINE — temporal confirmation + tiered alert state machine
 # ============================================================
 
 HAZARD_STATES = {
     "SAFE":     {"color": (89, 199, 52),   "label": "SAFE"},
-    "CAUTION":  {"color": (10, 214, 255),  "label": "CAUTION"},
-    "WARNING":  {"color": (10, 159, 255),  "label": "WARNING — SMOKE"},
-    "DANGER":   {"color": (58, 69, 255),   "label": "DANGER — FIRE"},
-    "CRITICAL": {"color": (85, 45, 255),   "label": "CRITICAL — FIRE + SMOKE"},
+    "CAUTION":  {"color": (10, 214, 255),  "label": "SIGHTING (unconfirmed)"},
+    "SMOKING":  {"color": (170, 170, 170), "label": "SMOKING / CIGARETTE"},     # gray frame
+    "WARNING":  {"color": (0, 165, 255),   "label": "EARLY FIRE — SMOKE"},      # orange + beeper
+    "DANGER":   {"color": (48, 59, 255),   "label": "FIRE — SIREN"},            # red
+    "CRITICAL": {"color": (48, 59, 255),   "label": "FIRE + SMOKE — SIREN"},    # red, stronger
 }
-_ORDER = ["SAFE", "CAUTION", "WARNING", "DANGER", "CRITICAL"]
+_ORDER = ["SAFE", "CAUTION", "SMOKING", "WARNING", "DANGER", "CRITICAL"]
 
 
 class HazardEngine:
     """Confirms classes over time so one flickering frame can't raise an alarm,
-    and one missed frame can't silently clear one (hysteresis)."""
+    and one missed frame can't silently clear one (hysteresis).
+    Confirmed smoke is split into two tiers by box size:
+    small -> SMOKING (cigarette, gray), large -> WARNING (early fire, orange)."""
 
     def __init__(self, cfg):
         self.w = cfg["confirm_window"]
         self.k = cfg["confirm_hits"]
         self.clear = cfg.get("clear_frames", 8)
+        self.cig_frac = cfg.get("cigarette_max_area_frac", 0.004)
         self.hist = {"fire": deque(maxlen=self.w), "smoke": deque(maxlen=self.w)}
         self.miss = {"fire": self.clear, "smoke": self.clear}
         self.active = {"fire": False, "smoke": False}
@@ -207,7 +223,7 @@ class HazardEngine:
         self.cooldown_s = cfg["alert_cooldown_s"]
         self._last_alarm_t = 0.0
 
-    def update(self, dets) -> dict:
+    def update(self, dets, frame_area) -> dict:
         present = {"fire": any(d.cls == "fire" for d in dets),
                    "smoke": any(d.cls == "smoke" for d in dets)}
         for c, hit in present.items():
@@ -221,16 +237,19 @@ class HazardEngine:
             elif self.active[c] and self.miss[c] >= self.clear:
                 self.active[c] = False                      # clear (hysteresis)
 
-        confirmed = dict(self.active)
-        any_seen = any(present.values())
+        fire, smoke = self.active["fire"], self.active["smoke"]
+        smoke_frac = max((d.area for d in dets if d.cls == "smoke"), default=0) / max(frame_area, 1)
+        big_smoke = smoke and smoke_frac >= self.cig_frac
 
-        if confirmed["fire"] and confirmed["smoke"]:
+        if fire and smoke:
             state = "CRITICAL"
-        elif confirmed["fire"]:
+        elif fire:
             state = "DANGER"
-        elif confirmed["smoke"]:
-            state = "WARNING"
-        elif any_seen:
+        elif smoke and big_smoke:
+            state = "WARNING"          # early fire — orange + beeper
+        elif smoke:
+            state = "SMOKING"          # cigarette — gray frame
+        elif any(present.values()):
             state = "CAUTION"
         else:
             state = "SAFE"
@@ -252,8 +271,9 @@ class HazardEngine:
             "state": state,
             "changed": changed,
             "escalated": escalated,
-            "confirmed_fire": confirmed["fire"],
-            "confirmed_smoke": confirmed["smoke"],
+            "confirmed_fire": fire,
+            "confirmed_smoke": smoke,
+            "smoke_frac": smoke_frac,
         }
 
 
@@ -304,12 +324,17 @@ def _dashed_circle(img, center, radius, color, n_seg=20, thick=2, alpha=0.0):
 
 
 def draw_overlay(frame, dets, eng_info, stats, t_idx) -> np.ndarray:
-    """All visual annotation: region highlight, brackets, danger zone, HUD, pulse."""
+    """All visual annotation: state styling, region marking, HUD, borders."""
     img = frame.copy()
     H, W = img.shape[:2]
     state = eng_info["state"]
+    sc = HAZARD_STATES[state]["color"]
 
-    # --- per-detection annotation ---
+    # --- cigarette mode: grayscale frame, region still marked on top ---
+    if state == "SMOKING":
+        img = cv2.cvtColor(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
+
+    # --- per-detection annotation (region marking in EVERY state) ---
     for d in dets:
         color = FIRE_COLOR if d.cls == "fire" else SMOKE_COLOR
         if d.cls == "fire":
@@ -325,8 +350,8 @@ def draw_overlay(frame, dets, eng_info, stats, t_idx) -> np.ndarray:
             cv2.line(img, (cx - 10, cy), (cx + 10, cy), FIRE_COLOR, 2, cv2.LINE_AA)
             cv2.line(img, (cx, cy - 10), (cx, cy + 10), FIRE_COLOR, 2, cv2.LINE_AA)
 
-    # --- pulsing border in critical states (drawn before HUD so it stays readable) ---
-    sc = HAZARD_STATES[state]["color"]
+    # --- alert borders: red pulsing for fire, orange pulsing for early smoke,
+    #     static gray frame border for cigarette mode ---
     if state in ("DANGER", "CRITICAL"):
         a = 0.30 + 0.22 * math.sin(2 * math.pi * t_idx / 15.0)
         b = 8 if state == "CRITICAL" else 5
@@ -334,6 +359,17 @@ def draw_overlay(frame, dets, eng_info, stats, t_idx) -> np.ndarray:
         _blend(img, 0, H - b, W, H, sc, a)
         _blend(img, 0, 0, b, H, sc, a)
         _blend(img, W - b, 0, W, H, sc, a)
+    elif state == "WARNING":
+        a = 0.30 + 0.18 * math.sin(2 * math.pi * t_idx / 10.0)
+        _blend(img, 0, 0, W, 5, sc, a)
+        _blend(img, 0, H - 5, W, H, sc, a)
+        _blend(img, 0, 0, 5, H, sc, a)
+        _blend(img, W - 5, 0, W, H, sc, a)
+    elif state == "SMOKING":
+        _blend(img, 0, 0, W, 3, sc, 0.45)
+        _blend(img, 0, H - 3, W, H, sc, 0.45)
+        _blend(img, 0, 0, 3, H, sc, 0.45)
+        _blend(img, W - 3, 0, W, H, sc, 0.45)
 
     # --- HUD (top-left, always on top) ---
     hud1 = f"FireGuard  |  {HAZARD_STATES[state]['label']}"
@@ -344,6 +380,79 @@ def draw_overlay(frame, dets, eng_info, stats, t_idx) -> np.ndarray:
     _chip(img, hud2, 10, y0 + 4, (20, 20, 20), scale=scale * 0.92, thick=1,
           text_color=(240, 240, 240), pad=5)
     return img
+
+
+# ============================================================
+# ALERT AUDIO — beeper (early smoke) / siren (fire) embedded in the MP4
+# ============================================================
+
+def _build_alert_audio(timeline, fps, path, sr=22050):
+    """Synthesize a mono WAV with beep patterns for WARNING and DANGER/CRITICAL
+    stretches. Returns True if the track has any sound."""
+    try:
+        states = [e["state"] for e in timeline]
+        if not states:
+            return False
+        dur = len(states) / fps + 0.5
+        n = int(dur * sr)
+        t = np.arange(n) / sr
+
+        def sample_mask(frame_mask):
+            reps = int(np.ceil(sr / fps))
+            m = np.repeat(frame_mask, reps)
+            return m[:n] if len(m) >= n else np.pad(m, (0, n - len(m)))
+
+        warn = sample_mask(np.array([s == "WARNING" for s in states]))
+        fire = sample_mask(np.array([s in ("DANGER", "CRITICAL") for s in states]))
+        audio = np.zeros(n)
+        if warn.any():                                   # 2 Hz beeps @ 880 Hz
+            audio += warn * (np.sin(2 * np.pi * 2.0 * t) > 0) * 0.55 * np.sin(2 * np.pi * 880 * t)
+        if fire.any():                                   # urgent 4 Hz siren @ 1200 Hz
+            audio += fire * (np.sin(2 * np.pi * 4.0 * t) > 0) * 0.8 * np.sin(2 * np.pi * 1200 * t)
+        if not audio.any():
+            return False
+
+        pcm = (np.clip(audio, -1, 1) * 32767).astype("<i2")
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(sr)
+            w.writeframes(pcm.tobytes())
+        return True
+    except Exception as e:                                # audio is best-effort
+        print(f"   ⚠️ audio track skipped: {e}")
+        return False
+
+
+def _mux_audio(video, wav, out):
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-i", video, "-i", wav,
+         "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
+         "-shortest", out],
+        capture_output=True,
+    )
+    return r.returncode == 0
+
+
+def _drive_backup(cfg):
+    """Colab only: copy results to MyDrive/FireGuard_Outputs."""
+    if not (IN_COLAB and cfg.get("drive_backup", True)):
+        return None
+    src_dir = cfg["output_dir"]
+    dest = "/content/drive/MyDrive/FireGuard_Outputs"
+    try:
+        os.makedirs(dest, exist_ok=True)
+        for f in os.listdir(src_dir):
+            p = os.path.join(src_dir, f)
+            if os.path.isfile(p):
+                shutil.copy2(p, dest)
+        snaps = os.path.join(src_dir, "snapshots")
+        if os.path.isdir(snaps):
+            shutil.copytree(snaps, os.path.join(dest, "snapshots"), dirs_exist_ok=True)
+        return dest
+    except Exception as e:
+        print(f"   ⚠️ Drive backup failed: {e}")
+        return None
 
 
 # ============================================================
@@ -358,8 +467,12 @@ def _resolve_profile(cfg):
     return cfg
 
 
+def _fmt_eta(s):
+    return f"{int(s // 60):02d}:{int(s % 60):02d}"
+
+
 def process_video(model, cfg, src, out_name="result.mp4", max_frames=None, quiet=False):
-    """Main loop: read -> detect -> confirm -> annotate -> write + log events."""
+    """Main loop: read -> detect -> confirm -> annotate -> write + log + audio."""
     cfg = _resolve_profile(dict(cfg))
     max_frames = max_frames or cfg["max_frames"]
 
@@ -385,14 +498,22 @@ def process_video(model, cfg, src, out_name="result.mp4", max_frames=None, quiet
             break
     n_total = min(total - cfg.get("start_frame", 0), max_frames) if max_frames else total - cfg.get("start_frame", 0)
     sample_at = set(np.linspace(0, max(n_total - 1, 1), cfg["display_samples"]).astype(int)) if n_total > 1 else {0}
+    print_every = max(n_total // 25, 1)
+
+    if not quiet:
+        est = n_total * 0.15 if DEVICE == "cpu" else n_total * 0.02
+        print(f"🎥 {W}x{H} @ {fps:.0f}fps — {n_total} frames to process"
+              f"  (rough ETA on {DEVICE.upper()}: ~{_fmt_eta(est)})")
 
     stats = {"fps": 0.0, "n_fire": 0, "n_smoke": 0, "frame": 0}
     t0, frames_done, det_frames, det_time = time.time(), 0, 0, 0.0
     fire_ever, smoke_ever = False, False
-    timeline = []               # per-frame state history for the summary plot
-    last_dets, last_info = [], {"state": "SAFE", "changed": False, "escalated": False,
-                                "confirmed_fire": False, "confirmed_smoke": False}
-    emap = {"SAFE": "🟢", "CAUTION": "🟡", "WARNING": "⚠️ ", "DANGER": "🚨", "CRITICAL": "🚨🚨"}
+    timeline = []               # per-frame state history for the summary plot + audio
+    last_dets = []
+    last_info = {"state": "SAFE", "changed": False, "escalated": False,
+                 "confirmed_fire": False, "confirmed_smoke": False, "smoke_frac": 0.0}
+    emap = {"SAFE": "🟢", "CAUTION": "🟡", "SMOKING": "🚬", "WARNING": "🟠",
+            "DANGER": "🚨", "CRITICAL": "🚨🚨"}
 
     while True:
         ret, frame = cap.read()
@@ -410,7 +531,7 @@ def process_video(model, cfg, src, out_name="result.mp4", max_frames=None, quiet
         else:
             dets = last_dets  # reuse boxes between skipped inferences
 
-        info = eng.update(dets)
+        info = eng.update(dets, W * H)
         stats.update(n_fire=sum(d.cls == "fire" for d in dets),
                      n_smoke=sum(d.cls == "smoke" for d in dets), frame=idx + 1)
         stats["fps"] = (idx + 1) / max(time.time() - t0, 1e-6)
@@ -437,8 +558,12 @@ def process_video(model, cfg, src, out_name="result.mp4", max_frames=None, quiet
             samples.append(annotated)
         writer.write(annotated)
 
-        if not quiet and n_total and (idx + 1) % max(n_total // 10, 1) == 0:
-            print(f"   ⏳ {100 * (idx + 1) / n_total:5.1f}%  ({idx + 1}/{n_total})  {stats['fps']:.1f} FPS")
+        # --- progress with ETA (visible end in sight) ---
+        if not quiet and ((idx + 1) % print_every == 0 or idx + 1 == n_total):
+            elapsed = time.time() - t0
+            eta = elapsed / (idx + 1) * (n_total - idx - 1)
+            print(f"   ▏{100 * (idx + 1) / n_total:5.1f}%  ({idx + 1}/{n_total})  "
+                  f"{stats['fps']:.1f} FPS  |  ETA {_fmt_eta(eta)}  |  {emap[info['state']]} {info['state']}")
 
     cap.release()
     writer.release()
@@ -450,7 +575,7 @@ def process_video(model, cfg, src, out_name="result.mp4", max_frames=None, quiet
             w.writeheader()
             w.writerows(events)
 
-    # re-encode to H.264 for universal playback (best effort)
+    # encode to H.264, then mux the beep/siren track (best effort)
     if shutil.which("ffmpeg"):
         r = subprocess.run(["ffmpeg", "-y", "-i", temp, "-vcodec", "libx264", "-crf", "23", final],
                            capture_output=True)
@@ -458,8 +583,17 @@ def process_video(model, cfg, src, out_name="result.mp4", max_frames=None, quiet
             os.remove(temp)
         else:
             shutil.move(temp, final)
+        if cfg.get("audio_alerts", True) and timeline:
+            wav = os.path.join(cfg["output_dir"], "_alerts.wav")
+            if _build_alert_audio(timeline, fps, wav):
+                with_audio = final.replace(".mp4", "_audio.mp4")
+                if _mux_audio(final, wav, with_audio):
+                    os.replace(with_audio, final)
+                os.remove(wav)
     else:
         shutil.move(temp, final)
+
+    drive_dest = _drive_backup(cfg)
 
     summary = {
         "frames": frames_done,
@@ -471,22 +605,27 @@ def process_video(model, cfg, src, out_name="result.mp4", max_frames=None, quiet
         "smoke_seen": smoke_ever,
         "final_state": eng.state,
         "output": final,
+        "drive": drive_dest,
         "timeline": timeline,
     }
     if not quiet:
         print("\n📊 SUMMARY")
         for k, v in summary.items():
-            print(f"   {k:>18}: {v}")
+            if k != "timeline":
+                print(f"   {k:>18}: {v}")
+        if drive_dest:
+            print(f"\n☁️  Results copied to Google Drive: {drive_dest}")
     return summary, samples
 
 
 if __name__ == "__main__":
     import sys
-    model_key = sys.argv[1] if len(sys.argv) > 1 else "yolov8n"
+    model_key = sys.argv[1] if len(sys.argv) > 1 else "yolo26s"
     n_frames = int(sys.argv[2]) if len(sys.argv) > 2 else 300
     model = load_model(model_key)
     cfg = dict(CONFIG)
     cfg["display_samples"] = 5
+    cfg["start_frame"] = 3400
     summary, samples = process_video(model, cfg, "fire_detection_result.mp4",
                                      out_name=f"result_{model_key}.mp4", max_frames=n_frames)
     for i, s in enumerate(samples[:5]):

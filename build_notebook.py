@@ -42,11 +42,13 @@ TITLE_MD = """
 ### ✨ What you get
 | Capability | How |
 |---|---|
-| 🎯 **Accurate detection** | Swappable pretrained models: **YOLOv8n / YOLO11s / YOLO26s** (no training needed) |
-| 🟥 **Region marking** | Fire area is filled, bracketed, labelled and wrapped in a dashed **safety zone** |
-| 🚦 **Hazard state machine** | `SAFE → CAUTION → WARNING → DANGER → CRITICAL` with temporal confirmation (no flicker, no false alarms) |
+| 🎯 **Accurate detection** | One tuned pretrained detector — **YOLO26s** (alternates for weak CPUs kept in the registry) |
+| 🟥 **Region marking — always** | Detected fire/smoke area is filled, bracketed and labelled in **every** alert state |
+| 🚦 **Tiered hazard states** | 🚬 `SMOKING` → grayscale frame · 🟠 `WARNING` (early smoke) → orange + **beeper** · 🚨 `DANGER`/`CRITICAL` (fire) → red + **siren** |
+| 🔊 **Audio alerts in the MP4** | Beeper for early smoke, urgent siren for confirmed fire — muxed into the output video |
 | 📢 **Smart alerts** | Anti-spam cooldown, `events.csv` timeline, evidence snapshots on every escalation |
-| ⚡ **Fast & light** | Per-class confidence, frame-skip, FP16 on GPU, CPU-friendly by default |
+| ⚡ **Fast & light** | Per-class confidence, frame-skip, live progress with ETA, CPU-friendly |
+| ☁️ **Drive output** | In Colab, results are copied to `MyDrive/FireGuard_Outputs` automatically |
 | 🧩 **Profiles** | `standard` / `fire-only` (government mode) / `early-smoke` (earliest warning) |
 
 ### 🇮🇷 فارسی
@@ -55,7 +57,7 @@ TITLE_MD = """
 ---
 """
 
-SETUP_MD = "## 1 · Setup\nInstalls everything (safe to re-run — skips what's already present). In **Colab**, enable GPU: `Runtime → Change runtime type → T4 GPU`."
+SETUP_MD = "## 1 · Setup\nInstalls everything (safe to re-run — skips what's already present). In **Colab**, enable GPU: `Runtime → Change runtime type → T4 GPU`."  # noqa: E501
 SETUP_CODE = """
 %pip install -q ultralytics huggingface_hub matplotlib pandas
 """
@@ -65,17 +67,20 @@ CONFIG_MD = """## 3 · Configuration — *the one cell you edit*
 
 | Knob | Meaning |
 |---|---|
-| `model` | `yolov8n` (fastest, 3.0M params) · `yolo11s` (balanced) · `yolo26s` (newest, most stable) · or a path to **any** custom `.pt` |
+| `model` | **`yolo26s` (default & recommended)** · alternates `yolov8n`/`yolo11s` for weak CPUs · or a path to **any** custom `.pt` |
 | `profile` | `standard` · `fire-only` (ignore smoke — e.g. government/open-terrain) · `early-smoke` (lowest smoke threshold) |
 | `conf_fire` / `conf_smoke` | `None` → taken from the profile; set a number to override |
 | `frame_skip` | run inference every Nth frame (2 ≈ 2× faster, boxes are reused between) |
+| `cigarette_max_area_frac` | smoke box smaller than this fraction of the frame → `SMOKING` (cigarette, grayscale) instead of `WARNING` (early fire, orange) |
+| `audio_alerts` | embed beeper/siren audio into the output MP4 |
+| `drive_backup` | Colab: copy results to `MyDrive/FireGuard_Outputs` |
 | `confirm_window` / `confirm_hits` / `clear_frames` | temporal hysteresis — how stubborn the alarms are |
 """
-REGISTRY_MD = "## 4 · Model zoo — three YOLO generations\nAll weights are **verified, public Hugging Face checkpoints** (downloaded once, cached in `models/`)."
+REGISTRY_MD = "## 4 · Model\n**`yolo26s` is the default and recommended detector** (verified public Hugging Face checkpoint, cached in `models/`). Two lighter alternates stay registered for very weak CPUs — switching is one line in the config cell."
 DETECT_MD = "## 5 · Detection layer\nNormalises every dataset's label spelling (`Fire`, `fire`, `FLAME`…) and applies per-class confidence + minimum-box-size filtering."
-HAZARD_MD = "## 6 · Hazard engine — state machine with hysteresis\nA fire alarm must be **confirmed over several frames** (no one-frame false positives) and **survives brief dropout** (no flicker)."
-OVERLAY_MD = "## 7 · Overlay renderer\nCorner brackets · label chips · translucent fire-region fill · dashed safety zone · HUD · pulsing border."
-PIPELINE_MD = "## 8 · Video pipeline\nRead → detect → confirm → annotate → write. Produces the annotated MP4 (H.264), `events.csv` and escalation snapshots."
+HAZARD_MD = "## 6 · Hazard engine — tiered alert state machine\nA fire alarm must be **confirmed over several frames** (no one-frame false positives) and **survives brief dropout** (no flicker). Confirmed smoke splits by size: tiny → `SMOKING` (cigarette, grayscale), large → `WARNING` (early fire, orange + beeper); confirmed fire → `DANGER`/`CRITICAL` (red + siren)."
+OVERLAY_MD = "## 7 · Overlay renderer\nCorner brackets · label chips · translucent fire-region fill · dashed safety zone · HUD · state-styled borders (red pulsing = fire, orange pulsing = early smoke, grayscale frame = cigarette)."
+PIPELINE_MD = "## 8 · Video pipeline\nRead → detect → confirm → annotate → write. Produces the annotated MP4 (H.264) with beep/siren audio, `events.csv` and escalation snapshots. In Colab, results are copied to Google Drive."
 VIZ_MD = "## 9 · Visualisation helpers"
 RUN_MD = "## 10 · Run it ▶️"
 RUN_CODE = """
@@ -114,7 +119,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from IPython.display import display
 
-STATE_ORDER = ["SAFE", "CAUTION", "WARNING", "DANGER", "CRITICAL"]
+STATE_ORDER = ["SAFE", "CAUTION", "SMOKING", "WARNING", "DANGER", "CRITICAL"]
 
 
 def _hex(bgr):
@@ -191,7 +196,7 @@ bench.to_csv(os.path.join(CONFIG["output_dir"], "benchmark.csv"), index=False)
 bench
 """
 EXTRAS_MD = """
-## 12 · Going further
+## 11 · Going further
 
 - **Custom weights** — trained your own model? Just set `CONFIG["model"] = "path/to/best.pt"`; any Ultralytics detect model works, label spelling is auto-normalised.
 - **Real-time camera** — replace the video path with `0` in OpenCV and stream through the same pipeline.
@@ -224,7 +229,6 @@ nb = {
         md(PIPELINE_MD), code(pipeline_c),
         md(VIZ_MD), code(VIZ_CODE),
         md(RUN_MD), code(RUN_CODE),
-        md(BENCH_MD), code(BENCH_CODE),
         md(EXTRAS_MD),
     ],
 }
