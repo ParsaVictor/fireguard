@@ -28,3 +28,15 @@ desktop.ini
 
 # Scratch files
 *.png.tmp
+
+# --- added 2026-09-04 ---
+# Scratch renders from ad-hoc runs (regenerated, not deliverables)
+sample_*.png
+smoketest_*.png
+render_*.png
+
+# Local dataset samples: third-party images kept only as a working aid
+dataset_samples/
+
+# Agent/editor state
+.mimosa/

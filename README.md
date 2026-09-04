@@ -1,166 +1,172 @@
 # 🔥 FireGuard
 
-**Real-time fire & smoke detection on video — broadcast-grade overlays, hazard-state intelligence, and three generations of YOLO in one pipeline.**
+**Fire & smoke detection for indoor CCTV — one notebook from raw datasets to a deployable model.**
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ParsaVictor/fireguard/blob/main/FireGuard.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ParsaVictor/fireguard/blob/main/FireGuard_Pipeline.ipynb)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
-![YOLO](https://img.shields.io/badge/YOLO-v8%20%7C%2011%20%7C%2026-8A2BE2)
-![Status](https://img.shields.io/badge/status-demo%20preview-orange)
+![YOLO](https://img.shields.io/badge/detector-YOLO26-8A2BE2)
+![Status](https://img.shields.io/badge/status-v0.2%20training%20pipeline-orange)
 
-> ⚠️ **Status: Demo release (v0.1)** — this is an early public preview for community review. The detection engine is fully working, but accuracy numbers are not yet benchmarked against standard fire datasets. Issue reports and PRs are very welcome!
+> **Status — v0.2.** The training pipeline is complete and tested; **accuracy numbers are not filled in yet**
+> (see [Results](#results)). v0.1 shipped an inference demo on third-party checkpoints of unknown
+> provenance — v0.2 replaces those with a model trained on documented, licensed data.
 >
-> ⚠️ **وضعیت: نسخه دمو (v0.1)** — این یک پیش‌نمایش اولیه برای بازخورد جامعه است. موتور تشخیص کاملاً کار می‌کند، اما اعداد دقت هنوز روی دیتاست‌های استاندارد ارزیابی نشده‌اند. گزارش باگ و پیشنهاد بسیار خوش‌آمدید!
->
-> 🇮🇷 [خلاصه فارسی](#-فارسی) در انتهای همین فایل.
-
-![FireGuard detection output](docs/demo_frame.png)
-
-*Fire region filled + bracketed, confidence chip, crosshair, and live HUD — the dashed safety zone wraps the detected seat of the fire.*
+> 🇮🇷 [خلاصهٔ فارسی](#فارسی) در انتهای فایل.
 
 ---
 
-## Why FireGuard?
+## Scope
 
-Anyone can call `model.predict()` on a video. FireGuard wraps three verified pretrained detectors in a **safety-oriented perception pipeline**:
+FireGuard targets **indoor and urban CCTV** — homes, offices, shops. Not wildfire towers, not drones.
 
-| | Raw YOLO | FireGuard |
+That choice drives everything else: which datasets are useful, which augmentations matter, and why
+the model is evaluated on false-alarm rate rather than mAP alone.
+
+| | |
+|---|---|
+| **Classes** | `0 = fire`, `1 = smoke` — two, nothing else |
+| **Input** | wide-angle IP cameras, 320×240 → 720p, heavy compression, IR night mode |
+| **Detector** | YOLO26 (`n`/`s`/`m`), fine-tuned from COCO weights |
+| **Metric that matters** | false alarms per camera per 24 h, then time-to-detection |
+
+---
+
+## Quickstart
+
+**[▶ Open `FireGuard_Pipeline.ipynb` in Colab](https://colab.research.google.com/github/ParsaVictor/fireguard/blob/main/FireGuard_Pipeline.ipynb)**
+→ `Runtime → Change runtime type → T4 GPU` → run the cells in order.
+
+One notebook, 14 sections, dataset download through TensorRT export:
+
+| § | Step | Every session? |
 |---|---|---|
-| Alarms | fire every frame → spam / flicker | **temporal confirmation + hysteresis** → stable `SAFE → CAUTION → WARNING → DANGER → CRITICAL` state machine |
-| Region marking | plain rectangles | corner brackets, **translucent fire-region fill**, dashed safety zone, label chips, HUD, pulsing alert border |
-| Evidence | none | `events.csv` incident log + **PNG snapshots on every escalation** |
-| Speed knobs | — | per-class confidence, `frame_skip` box reuse, FP16 on GPU, model swap |
-| Flexibility | one model | **yolov8n / yolo11s / yolo26s** — or any custom `.pt`, labels auto-normalised |
+| 1–2 | Install, hardware auto-tune, settings | ✅ |
+| 3 | Parallel dataset download → Drive | first run |
+| 4–5 | Merge, class fix, dedup, group-aware split, audit | first run |
+| 6–8 | CCTV augmentation, 🚁 3-minute smoke test, baseline | first run |
+| 9 | 🔬 A/B ablation on augmentation | optional |
+| 10 | **Training** — progressive resolution, auto-resume | ✅ |
+| 11–14 | Evaluation, operating point, export, model card | after training |
 
-## ✨ Features
+Weights land in `MyDrive/FireGuard_Runs/<RUN>/final/` with a `model_card.json`.
 
-- 🎯 **Zero-training detection** — pretrained public checkpoints, downloaded once and cached
-- 🚦 **Hazard state machine** — `SAFE / CAUTION / WARNING / DANGER / CRITICAL` with confirmation window and clear hysteresis (no one-frame false alarms, no flicker)
-- 🟥 **Fire-region marking** — the burning area is filled, bracketed, measured, and wrapped in a dashed safety zone with crosshair
-- 📢 **Smart alerting** — anti-spam cooldown, per-incident `events.csv`, evidence snapshots
-- ⚡ **Light & fast** — 3M-param nano model runs ~6 FPS on a plain CPU; GPU gives real-time+
-- 🧩 **Profiles** — `standard`, `fire-only` (ignore smoke: government / open-terrain), `early-smoke` (earliest possible warning)
-- 🖼️ **Broadcast-style overlay** — HUD, label chips, FPS/state readout, pulsing border in DANGER/CRITICAL
-
-## 🤖 Model zoo
-
-All weights are public Hugging Face checkpoints, verified working with this pipeline:
-
-| Key | Checkpoint | Params | CPU ms/frame* | Best for |
-|---|---|---|---|---|
-| `yolov8n` | `rabahdev/fire-smoke-yolov8n` | 3.0M | ~150 | edge / weak CPU |
-| `yolo11s` | `leeyunjai/yolo11-firedetect` | 9.4M | ~280 | balanced |
-| `yolo26s` | `SalahALHaismawi/yolov26-fire-detection` | 9.9M | ~395 | best stability & accuracy |
-
-\* measured on one CPU core at `imgsz=640`; expect **10–30× faster with any GPU**. Switch with one line: `CONFIG["model"] = "yolo11s"` — or point it at **your own** fine-tuned `.pt`.
-
-## 🚀 Quickstart
-
-**Option A — Google Colab (recommended, free GPU):**
-
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ParsaVictor/fireguard/blob/main/FireGuard.ipynb)
-`Runtime → Change runtime type → T4 GPU`, then Run all. Point `VIDEO_PATH` at a video in your Drive.
-
-**Option B — local:**
+Do not hand-edit the notebook — edit `build_pipeline_notebook.py` and regenerate:
 
 ```bash
-git clone https://github.com/ParsaVictor/fireguard.git
-cd fireguard
-pip install -r requirements.txt
-jupyter lab FireGuard.ipynb
+python build_pipeline_notebook.py
 ```
-
-The repo ships with a short demo clip (`fire_detection_result.mp4`) so the notebook runs out of the box.
-
-## ⚙️ Configuration (one cell)
-
-```python
-CONFIG = {
-    "model":   "yolo26s",   # yolov8n | yolo11s | yolo26s | path/to/custom.pt
-    "profile": "standard",  # standard | fire-only | early-smoke
-    "conf_fire":  None,     # None -> profile default (0.30)
-    "conf_smoke": None,     # None -> profile default (0.25)
-    "frame_skip": 1,        # 2 = ~2x faster, boxes reused between inferences
-    ...
-}
-```
-
-| Profile | Fire | Smoke | Use case |
-|---|---|---|---|
-| `standard` | ✅ 0.30 | ✅ 0.25 | general monitoring |
-| `fire-only` | ✅ 0.30 | ❌ | government / wildfire — smoke too ambiguous |
-| `early-smoke` | ✅ 0.35 | ✅ **0.15** | earliest warning, indoor/warehouse |
-
-## 🧠 Pipeline
-
-```
-video ─▶ frame ─▶ YOLO detect ─▶ label normalise ─▶ per-class conf/size filter
-                                    │
-                     HazardEngine ──┘   (confirm window: 2 hits / 5 frames
-                                        clear hysteresis: 8 misses)
-                                    │
-              state ∈ {SAFE, CAUTION, WARNING, DANGER, CRITICAL}
-                                    │
-        ┌───────────┬───────────────┼────────────────┬──────────────┐
-     overlay      alerts        events.csv      snapshots      result.mp4
-   (brackets,   (cooldown     (incident       (evidence      (H.264 via
-    fill, zone,  anti-spam)     timeline)       PNGs)           ffmpeg)
-    HUD, pulse)
-```
-
-## 📁 Repository structure
-
-```
-fireguard/
-├── FireGuard.ipynb          # ← everything: pipeline, demo run, benchmark
-├── fireguard_core.py        # same engine as an importable module
-├── fire_detection_result.mp4# bundled demo clip
-├── requirements.txt
-├── LICENSE
-└── docs/                    # demo frames used in this README
-```
-
-Outputs land in `outputs/`: `fireguard_result.mp4`, `events.csv`, `snapshots/*.png`, `benchmark.csv`.
-
-## 📸 Output
-
-- **Video** — annotated MP4 (H.264): fire region filled red + bracketed, dashed safety zone, `FIRE 96.4%` chips, HUD with live state & FPS, pulsing border under DANGER/CRITICAL
-- **`events.csv`** — every state transition with frame, timestamp, counts
-- **Snapshots** — PNG evidence frame captured at each escalation
-- **Hazard timeline** — the whole incident at a glance:
-
-![Hazard state over time](docs/hazard_timeline.png)
-
-## 🛣️ Roadmap
-
-- [ ] Live RTSP / webcam multi-camera manager
-- [ ] Object tracking IDs (count *distinct* fire seats)
-- [ ] Burned-area & spread-rate estimation
-- [ ] Telegram / webhook alert integration
-- [ ] Gradio web demo
-- [ ] ONNX / TensorRT export recipes for Jetson & RPi5
-
-## 🤝 Contributing
-
-Issues and PRs welcome — especially new **verified model checkpoints** for the zoo (open an issue with a benchmark on your data).
-
-## 📄 License
-
-[MIT](LICENSE) — free for commercial and personal use.
-
-> ⚠️ FireGuard is an assistive tool. Always follow local fire-safety regulations; never deploy it as the sole life-safety system.
 
 ---
 
-## 🇮🇷 فارسی
+## Data
 
-**FireGuard** یک سیستم هوشمند تشخیص آتش و دود روی ویدیو است:
+| Dataset | Images | Composition | Format | License |
+|---|---|---|---|---|
+| **FASDD_CV** | 95,126 | 39,114 negative · 23,350 smoke · 20,126 both · 12,536 fire | YOLO / VOC / COCO | **CC BY 4.0** |
+| **D-Fire** | 21,527 | 9,838 negative · 5,867 smoke · 4,658 both · 1,164 fire | YOLO | free |
+| **Merged** | ~113k | ~37k with fire · ~53k with smoke · ~48k negative | YOLO | — |
 
-- **بدون نیاز به آموزش** — سه مدل آماده و راستی‌آزمایی‌شده (YOLOv8n / YOLO11s / YOLO26s) که با یک خط کد عوض می‌شوند
-- **مشخص‌سازی محدوده آتش** — ناحیه آتش با پرشدگی قرمز ملایم، براکت‌های گوشه، برچسب درصد اطمینان و **ناحیه ایمنی خط‌چین** مشخص می‌شود
-- **ماشین وضعیت خطر** — از `SAFE` تا `CRITICAL` با تأیید چندفریمی و هیسترزیس؛ بدون هشدار کاذب و بدون فلیکر
-- **هشدار و مستندسازی** — ضد اسپم، فایل `events.csv` از رویدادها و اسنپ‌شات تصویری هنگام تشدید خطر
-- **پروفایل‌های آماده** — استاندارد، فقط-آتش (مناسب نهادها و فضای باز)، و دود-زودهنگام (حداکثر حساسیت)
-- **سبک و سریع** — از اجرای ~۶ فریم بر ثانیه روی CPU معمولی تا Real-time+ روی GPU
+FASDD_CV is the backbone: it explicitly spans indoor/outdoor, day/night, near/far, and surveillance
+cameras. D-Fire contributes its 9,838 deliberately-confusing negatives — sunsets, lamp glare,
+cloud-that-looks-like-smoke.
 
-اجرا در Colab با یک کلیک (دکمه بالا) یا به‌صورت محلی با `pip install -r requirements.txt`.
+Deliberately **excluded**: Pyro-SDIS, FIgLib, FLAME (wildfire towers and drones — wrong domain) and
+DetectiumFire (CC BY-NC, unusable in a product).
+
+Numbers above were measured directly from the archives, not quoted from papers — see
+[`DATASET_AUDIT.md`](DATASET_AUDIT.md).
+
+---
+
+## Traps this pipeline handles
+
+Each of these was measured, not assumed. Any of them silently ruins a naive merge.
+
+| # | Trap | Handling |
+|---|---|---|
+| 1 | **Class maps are opposite.** FASDD is `0=fire`, D-Fire is `0=smoke` | D-Fire labels flipped with `1-c` |
+| 2 | **D-Fire's `AoF` split is consecutive video frames** — adjacent frames measured 80–90 % similar | group-aware split |
+| 3 | Those same-event frames sit **6–13 bits apart** — far outside the dedup threshold of 3 | second threshold: distance 4–12 → keep both, lock to one split |
+| 4 | ~39k plain negatives (sky, walls) share **identical hashes** and formed a bucket the pairwise search skipped | exact-hash pass in O(n) before near-duplicate search |
+| 5 | **`imgsz > 640` is wasted** — FASDD images are capped at 640 px on the long side | hard ceiling at 640 |
+| 6 | **`resume=True` overwrites every arg from the checkpoint** (`trainer.py`: `self.args = get_cfg(ckpt_args)`) | each resolution stage is a fresh `train()`; resume only *within* a stage |
+| 7 | Google Drive is very slow with many small files | data and weights on local disk; Drive sync on a background thread |
+| 8 | Public datasets are clean web images; real CCTV is not | compression / downscale / grayscale / motion-blur augmentation via Ultralytics' official `augmentations=` hook |
+
+A known label-semantics caveat: FASDD labels **candles and matches as `fire`**. Left in for now —
+the plan is to separate them in the decision layer by size and persistence rather than by deleting data.
+
+---
+
+## Results
+
+Not yet measured. Filled in after the first full training run.
+
+| Metric | Value |
+|---|---|
+| mAP@50 — overall | — |
+| mAP@50 — fire | — |
+| mAP@50 — smoke | — |
+| False alarms / camera / 24 h | — |
+| Latency (T4, TensorRT FP16) | — |
+
+Note: smoke mAP is always lower than fire mAP. Smoke has no crisp boundary — two expert annotators
+will not draw the same box. Report them separately.
+
+---
+
+## Where this is going
+
+Three tiers sharing one evidence bus, detailed in [`PLAN_V2.md`](PLAN_V2.md):
+
+- **SPARK** — edge tier (RPi5 / Jetson Orin Nano), motion-gated inference
+- **BLAZE** — commercial tier: tracking + a flame-flicker DFT verifier (real flames oscillate at 2–12 Hz;
+  sunsets and traffic cones do not) + plume-growth verification, fused as log-odds per tracked fire
+- **INFERNO** — server tier: multi-resolution ensemble, VLM adjudication, abstention, and distillation
+  back into the smaller two
+
+---
+
+## Repository
+
+```
+FireGuard_Pipeline.ipynb      ← the notebook: data → training → export
+build_pipeline_notebook.py    ← its generator (edit this, not the notebook)
+fireguard_core.py             ← v0.1 inference engine: hazard state machine + overlays
+FireGuard.ipynb               ← v0.1 inference demo
+PLAN_V2.md                    ← three-tier architecture
+DATA_AND_MODELS.md            ← model and dataset selection, with reasoning
+DATASET_AUDIT.md              ← measured dataset facts and the eight traps
+legacy/                       ← superseded two-notebook version
+```
+
+---
+
+## License
+
+[MIT](LICENSE) for this code. Datasets keep their own licenses (FASDD_CV is CC BY 4.0 — attribution required).
+
+⚠️ The current pipeline builds on Ultralytics YOLO, which is **AGPL-3.0**. For a closed commercial
+product the same recipe should be ported to D-FINE or RF-DETR (both Apache-2.0). See `DATA_AND_MODELS.md`.
+
+> FireGuard is an assistive tool. Follow local fire-safety regulations; never deploy it as the sole
+> life-safety system.
+
+---
+
+## فارسی
+
+**FireGuard** یک سامانهٔ تشخیص آتش و دود برای **دوربین مداربستهٔ داخلی** است — خانه، دفتر، مغازه.
+نه برج جنگلی، نه پهپاد.
+
+- **دو کلاس و بس:** `0 = fire` · `1 = smoke`
+- **یک نوت‌بوک:** [`FireGuard_Pipeline.ipynb`](FireGuard_Pipeline.ipynb) — از دانلود دیتاست تا خروجی TensorRT
+- **داده:** FASDD_CV (۹۵,۱۲۶ تصویر، CC BY 4.0) + D-Fire (۲۱,۵۲۷) ≈ **۱۱۳ هزار تصویر**
+- **هشت تله** که همه‌شان اندازه‌گیری شدند و در خط لوله حل شده‌اند — مهم‌ترینشان اینکه
+  **نگاشت کلاس دو دیتاست دقیقاً برعکس هم است**
+- **معیاری که مهم است:** نرخ آلارم کاذب در هر دوربین در ۲۴ ساعت، نه فقط mAP
+
+وضعیت: خط لولهٔ آموزش کامل و آزمایش‌شده است؛ **اعداد دقت هنوز پر نشده‌اند.**
+
+نوت‌بوک را دستی ویرایش نکن — `build_pipeline_notebook.py` را عوض کن و دوباره بساز.
